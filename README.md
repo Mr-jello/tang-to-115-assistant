@@ -57,7 +57,7 @@
 ### 3.1：从 GreasyFork 安装
 1. 安装 Violentmonkey 浏览器扩展（脚本依赖于油猴的GM_cookie功能，但是该功能在稳定版的油猴还没有开放，所以需要使用Beta版本来运行该脚本）。
 2. 打开 `chrome://extensions/` 页面，启用开发者模式，找到 Violentmonkey 插件，点击“详情”，在“扩展选项”中找到“允许运行用户脚本”选项并启用它。
-3. 访问 [98堂-115离线助手](https://greasyfork.org/zh-CN/scripts/xxxx) 页面，点击“安装此脚本”按钮。**还未发布到 GreasyFork，敬请期待**。
+3. 访问 [98堂-115离线助手](https://greasyfork.org/zh-CN/scripts/576470-98%E5%A0%82-115%E7%A6%BB%E7%BA%BF%E5%8A%A9%E6%89%8B) 页面，点击“安装此脚本”按钮。
 4. 在弹出的安装界面中确认安装（确保安装到 Violentmonkey中）。
 
 ### 3.2：从 GitHub 手动安装

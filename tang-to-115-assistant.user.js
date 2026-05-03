@@ -5,6 +5,7 @@
 // @namespace    https://github.com/Mr-jello/tang-to-115-assistant
 // @version      2.3.0
 // @description  从论坛提取 magnet / ed2k，按帖子标题清洗后在 115 指定父目录下创建子目录，并把离线任务保存到该子目录。若是压缩包，则可自动解压并删除原压缩包。
+// @description:en Extract magnet/ed2k links from forum, create subfolder in 115 with cleaned post title under specified parent directory, and save offline tasks to the subfolder. If it's an archive file, it can be automatically extracted and the original archive can be deleted.
 // @author       Mr-jello
 // @license      Apache License 2.0
 // @match        *://*.115.com/*
