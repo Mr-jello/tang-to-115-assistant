@@ -3,7 +3,7 @@
 // @name:zh-CN   98堂-115离线助手
 // @name:en      98tang to 115 offline helper
 // @namespace    https://github.com/Mr-jello/tang-to-115-assistant
-// @version      2.3.0
+// @version      3.0.0
 // @description  从论坛提取 magnet / ed2k，按帖子标题清洗后在 115 指定父目录下创建子目录，并把离线任务保存到该子目录。若是压缩包，则可自动解压并删除原压缩包。
 // @description:en Extract magnet/ed2k links from forum, create subfolder in 115 with cleaned post title under specified parent directory, and save offline tasks to the subfolder. If it's an archive file, it can be automatically extracted and the original archive can be deleted.
 // @author       Mr-jello
@@ -38,6 +38,8 @@
 // @connect      115.com
 // @connect      webapi.115.com
 // @connect      *
+// @require      https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.7.52/dist/zip.min.js
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -97,6 +99,9 @@
       Number(GM_getValue("extractProgressPollIntervalSec", 10)) || 10,
 
     extractPassword: GM_getValue("extractPassword", ""),
+
+    // 压缩包根层只有一个文件夹时，直接将其内容解压到标题目录（避免双层嵌套）
+    enableUnwrapSingleFolder: GM_getValue("enableUnwrapSingleFolder", false),
   };
 
   const requireCookieNames = ["UID", "CID", "SEID"];
@@ -111,12 +116,25 @@
   }
 
   function encodeForm(data) {
-    return Object.keys(data)
-      .map((key) => {
-        const value = data[key] == null ? "" : String(data[key]);
-        return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-      })
-      .join("&");
+    const parts = [];
+
+    Object.keys(data).forEach((key) => {
+      const value = data[key];
+
+      if (Array.isArray(value)) {
+        value.forEach((item) => {
+          parts.push(
+            `${encodeURIComponent(key)}=${encodeURIComponent(item == null ? "" : String(item))}`,
+          );
+        });
+      } else {
+        parts.push(
+          `${encodeURIComponent(key)}=${encodeURIComponent(value == null ? "" : String(value))}`,
+        );
+      }
+    });
+
+    return parts.join("&");
   }
 
   function gmRequest(options) {
@@ -252,7 +270,13 @@
     return name || "未命名任务";
   }
 
+  let _linksCache = { href: "", links: [] };
+
   function extractLinksFromPage() {
+    if (_linksCache.href === location.href && _linksCache.links.length > 0) {
+      return _linksCache.links;
+    }
+
     let rawLinks = [];
 
     const codeBlocks = document.querySelectorAll(
@@ -273,8 +297,11 @@
       .filter(Boolean);
 
     const uniqueLinks = uniqueArray(normalizedLinks);
+    const result = uniqueLinks.filter((link) => isValidDownloadLink(link));
 
-    return uniqueLinks.filter((link) => isValidDownloadLink(link));
+    _linksCache = { href: location.href, links: result };
+
+    return result;
   }
 
   function matchLinks(text) {
@@ -628,19 +655,21 @@
 
     const text = res.responseText || "";
 
-    if (text.includes("成功")) return "添加" + text;
-
+    // 优先尝试解析 JSON，避免 try/catch 嵌套吞掉业务错误
+    let json = null;
     try {
-      const json = JSON.parse(text);
+      json = JSON.parse(text);
+    } catch (_) {}
 
+    if (json !== null) {
       if (json.success || json.state) {
         return json.message || "Bot 添加成功";
       }
-
-      throw new Error(json.message || json.error || text);
-    } catch (e) {
-      throw new Error(text || "Bot 添加失败");
+      throw new Error(json.message || json.error || "Bot 添加失败");
     }
+
+    if (text.includes("成功")) return "添加" + text;
+    throw new Error(text || "Bot 添加失败");
   }
 
   function sleep(ms) {
@@ -797,11 +826,55 @@
     return list;
   }
 
-  function buildExtractBody(pickCode, targetFolderId, entries) {
+  // 读取压缩包内某个子目录的条目列表，用于「展开单层文件夹」
+  async function getArchiveSubEntries(pickCode, subFolderName) {
+    const url =
+      `${config.extractInfoUrl}?pick_code=${encodeURIComponent(pickCode)}` +
+      `&file_name=${encodeURIComponent(subFolderName)}` +
+      `&paths=${encodeURIComponent("\u6587\u4ef6/" + subFolderName)}` +
+      `&page_count=999`;
+
+    extractStatus(`\u8bfb\u53d6\u5b50\u76ee\u5f55\uff1a${subFolderName}`, {
+      url,
+    });
+
+    const resData = await gmJsonRequest({
+      method: "GET",
+      url,
+      headers: {
+        Accept: "*/*",
+        Referer: "https://115.com/",
+      },
+    });
+
+    if (!resData.state) {
+      throw new Error(
+        resData.message ||
+          resData.error ||
+          `\u8bfb\u53d6\u5b50\u76ee\u5f55 ${subFolderName} \u5931\u8d25`,
+      );
+    }
+
+    const list =
+      resData.data && Array.isArray(resData.data.list) ? resData.data.list : [];
+
+    extractStatus(
+      `\u5b50\u76ee\u5f55 "${subFolderName}" \u5171 ${list.length} \u9879`,
+    );
+
+    return list;
+  }
+
+  function buildExtractBody(
+    pickCode,
+    targetFolderId,
+    entries,
+    paths = "\u6587\u4ef6",
+  ) {
     const params = {
       pick_code: pickCode,
       to_pid: targetFolderId,
-      paths: "文件",
+      paths,
     };
 
     const extractDirs = [];
@@ -830,29 +903,7 @@
       params["extract_file[]"] = extractFiles;
     }
 
-    return encodeFormWithArray(params);
-  }
-
-  function encodeFormWithArray(data) {
-    const parts = [];
-
-    Object.keys(data).forEach((key) => {
-      const value = data[key];
-
-      if (Array.isArray(value)) {
-        value.forEach((item) => {
-          parts.push(
-            `${encodeURIComponent(key)}=${encodeURIComponent(item == null ? "" : String(item))}`,
-          );
-        });
-      } else {
-        parts.push(
-          `${encodeURIComponent(key)}=${encodeURIComponent(value == null ? "" : String(value))}`,
-        );
-      }
-    });
-
-    return parts.join("&");
+    return encodeForm(params);
   }
 
   async function delete115File(parentCid, fileItem) {
@@ -863,7 +914,7 @@
       throw new Error(`无法删除压缩包，缺少 fid：${name}`);
     }
 
-    const body = encodeFormWithArray({
+    const body = encodeForm({
       pid: parentCid,
       ignore_warn: 1,
       "fid[0]": fid,
@@ -896,8 +947,13 @@
     return true;
   }
 
-  async function submitExtractTask(pickCode, targetFolderId, entries) {
-    const body = buildExtractBody(pickCode, targetFolderId, entries);
+  async function submitExtractTask(
+    pickCode,
+    targetFolderId,
+    entries,
+    paths = "\u6587\u4ef6",
+  ) {
+    const body = buildExtractBody(pickCode, targetFolderId, entries, paths);
 
     extractStatus(`提交解压任务：${entries.length} 项`);
 
@@ -977,12 +1033,36 @@
 
     await waitArchiveParsed(pickCode);
 
-    const entries = await getArchiveRootEntries(pickCode);
+    const rootEntries = await getArchiveRootEntries(pickCode);
+
+    let finalEntries = rootEntries;
+    let finalPaths = "\u6587\u4ef6";
+
+    if (
+      config.enableUnwrapSingleFolder &&
+      rootEntries.length === 1 &&
+      isExtractInfoDir(rootEntries[0])
+    ) {
+      const wrapperName = getExtractEntryName(rootEntries[0]);
+      extractStatus(
+        `\u68c0\u6d4b\u5230\u5355\u5c42\u6587\u4ef6\u5939 "${wrapperName}"\uff0c\u5c55\u5f00\u5185\u5bb9\u76f4\u63a5\u89e3\u538b\u5230\u5f53\u524d\u76ee\u5f55`,
+      );
+      const subEntries = await getArchiveSubEntries(pickCode, wrapperName);
+      if (subEntries.length > 0) {
+        finalEntries = subEntries;
+        finalPaths = "\u6587\u4ef6/" + wrapperName;
+      } else {
+        extractStatus(
+          `\u5b50\u76ee\u5f55 "${wrapperName}" \u4e3a\u7a7a\uff0c\u9000\u56de\u6839\u5c42\u89e3\u538b`,
+        );
+      }
+    }
 
     const extractId = await submitExtractTask(
       pickCode,
       targetFolderId,
-      entries,
+      finalEntries,
+      finalPaths,
     );
 
     await waitExtractDone(extractId);
@@ -1028,8 +1108,20 @@
     return [];
   }
 
+  // 记录正在监控的目录 cid，防止同一目录被重复启动多套轮询器
+  const _activeExtractMonitors = new Set();
+
   function scheduleAutoExtractMonitor(folderCid, folderName) {
     if (!config.enableAutoExtractAfterDownload || !folderCid) return;
+
+    if (_activeExtractMonitors.has(folderCid)) {
+      extractStatus(
+        `自动解压监控已在运行，跳过重复启动：${folderName || folderCid}`,
+      );
+      return;
+    }
+
+    _activeExtractMonitors.add(folderCid);
 
     const delaySec = Number(config.autoExtractStartDelaySec) || 10;
     const retryCount = Number(config.autoExtractStartRetryCount) || 3;
@@ -1048,6 +1140,7 @@
         .then((foundAndHandled) => {
           if (foundAndHandled) {
             extractStatus("自动解压流程完成");
+            _activeExtractMonitors.delete(folderCid);
             return;
           }
 
@@ -1056,11 +1149,13 @@
             setTimeout(run, delaySec * 1000);
           } else {
             extractStatus("未发现可解压压缩包，自动解压监控结束");
+            _activeExtractMonitors.delete(folderCid);
           }
         })
         .catch((e) => {
           extractStatus(`自动解压失败：${e.message || e}`);
           notify("自动解压失败：" + (e.message || e));
+          _activeExtractMonitors.delete(folderCid);
         });
     };
 
@@ -1425,10 +1520,528 @@
         word-break: break-all;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "Microsoft YaHei", sans-serif;
       }
+
+      .tm115-txt-btn {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1px 8px;
+        border-radius: 4px;
+        border: 1px solid #d42f2f;
+        color: #d42f2f;
+        font-size: 11px;
+        cursor: pointer;
+        user-select: none;
+        vertical-align: middle;
+        background: transparent;
+        transition: background .15s, color .15s;
+      }
+      .tm115-txt-btn:hover {
+        background: #d42f2f;
+        color: #fff;
+      }
+
+      .tm115-txt-panel {
+        position: absolute;
+        z-index: 999999;
+        width: 520px;
+        max-height: 480px;
+        display: flex;
+        flex-direction: column;
+        border-radius: 10px;
+        background: #fff;
+        box-shadow: 0 8px 32px rgba(0,0,0,.22);
+        border: 1px solid #e5e7eb;
+        font-size: 13px;
+        overflow: hidden;
+      }
+      .tm115-txt-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 12px;
+        background: #f9fafb;
+        border-bottom: 1px solid #e5e7eb;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+      .tm115-txt-panel-title {
+        font-weight: 600;
+        color: #374151;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+        min-width: 0;
+      }
+      .tm115-txt-panel-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .tm115-txt-panel-close {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 16px;
+        color: #9ca3af;
+        line-height: 1;
+        padding: 2px 4px;
+        border-radius: 4px;
+      }
+      .tm115-txt-panel-close:hover { background: #f3f4f6; color: #374151; }
+      .tm115-txt-panel-links {
+        padding: 8px 12px;
+        flex: 1;
+        overflow-y: auto;
+      }
+      .tm115-txt-panel-section-title {
+        font-size: 11px;
+        color: #6b7280;
+        margin-bottom: 4px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+      }
+      .tm115-txt-link-item {
+        font-size: 12px;
+        color: #374151;
+        padding: 2px 0;
+        word-break: break-all;
+        font-family: Consolas, Monaco, monospace;
+      }
     `;
 
     document.head.appendChild(style);
   }
+
+  // ─────────────────────────────────────────────────────────────
+
+  function initArchiveAttachmentPreview() {
+    if (location.hostname.includes("115.com")) return;
+
+    document.querySelectorAll('a[href*="mod=attachment"]').forEach((link) => {
+      if (link.dataset.tm115ArchiveDone) return;
+
+      const rawName =
+        (link.innerText || link.textContent || "").trim() ||
+        decodeURIComponent(link.href.split("?")[0].split("/").pop());
+
+      const ext = rawName.split(".").pop().toLowerCase();
+      if (ext !== "zip") return;
+
+      link.dataset.tm115ArchiveDone = "true";
+
+      const btn = document.createElement("span");
+      btn.className = "tm115-txt-btn";
+      btn.textContent = "解析压缩包";
+      btn.title =
+        "下载 ZIP 压缩包，解析内部 TXT / XLSX 中的 magnet / ed2k 链接";
+
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (btn._panel && document.body.contains(btn._panel)) {
+          btn._panel.remove();
+          btn._panel = null;
+          btn.textContent = "解析压缩包";
+          return;
+        }
+
+        if (typeof zip === "undefined" || !zip.ZipReader) {
+          notify("请重新安装脚本并刷新页面（首次需要加载 zip.js 库）");
+          return;
+        }
+
+        btn.textContent = "解析中…";
+        fetchZipAndShowPanel(link.href, btn, rawName);
+      });
+
+      link.after(btn);
+    });
+  }
+
+  async function fetchZipAndShowPanel(
+    href,
+    btn,
+    archiveName,
+    password,
+    _cachedBuffer,
+  ) {
+    try {
+      // 下载压缩包（有缓存则复用，避免重复下载）
+      const buffer =
+        _cachedBuffer ||
+        (await new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: "GET",
+            url: href,
+            responseType: "arraybuffer",
+            timeout: 60000,
+            headers: { Referer: location.href },
+            onload: (r) =>
+              r.status >= 200 && r.status < 300
+                ? resolve(r.response)
+                : reject(new Error(`HTTP ${r.status}`)),
+            onerror: () => reject(new Error("网络错误")),
+            ontimeout: () => reject(new Error("下载超时")),
+          });
+        }));
+
+      // 使用 zip.js 解析（支持 AES / ZipCrypto 加密）
+      const reader = new zip.ZipReader(
+        new zip.Uint8ArrayReader(new Uint8Array(buffer)),
+        { useWebWorkers: false },
+      );
+      let entries;
+      try {
+        entries = await reader.getEntries();
+      } catch (e) {
+        await reader.close().catch(() => {});
+        throw e;
+      }
+
+      // 检测是否含加密文件，提前弹密码框（避免逐文件报错）
+      const hasEncrypted = entries.some((e) => !e.directory && e.encrypted);
+      if (hasEncrypted && !password) {
+        await reader.close().catch(() => {});
+        showZipPasswordDialog(archiveName, null, (pwd) => {
+          if (pwd !== null) {
+            btn.textContent = "解析中…";
+            fetchZipAndShowPanel(href, btn, archiveName, pwd, buffer);
+          }
+        });
+        return;
+      }
+
+      const allLinks = [];
+      const fileResults = [];
+      const opts = password ? { password } : {};
+
+      for (const entry of entries) {
+        if (entry.directory) continue;
+        const path = entry.filename;
+        const ext = path.split(".").pop().toLowerCase();
+
+        if (ext === "txt") {
+          let text = "";
+          try {
+            text = await entry.getData(new zip.TextWriter("utf-8"), opts);
+            if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+          } catch {
+            try {
+              const buf = await entry.getData(new zip.Uint8ArrayWriter(), opts);
+              text = new TextDecoder("gbk").decode(buf);
+            } catch {
+              continue;
+            }
+          }
+          const links = uniqueArray(
+            matchLinks(text)
+              .map(normalizeDownloadLink)
+              .filter(isValidDownloadLink),
+          );
+          allLinks.push(...links);
+          fileResults.push({ name: path, count: links.length });
+        } else if (ext === "xlsx") {
+          if (typeof XLSX === "undefined") {
+            fileResults.push({ name: path, count: 0 });
+            continue;
+          }
+          let buf;
+          try {
+            buf = await entry.getData(new zip.Uint8ArrayWriter(), opts);
+          } catch {
+            continue;
+          }
+          const wb = XLSX.read(buf, { type: "array" });
+          let text = "";
+          wb.SheetNames.forEach((s) => {
+            const ws = wb.Sheets[s];
+            const ref = ws["!ref"];
+            if (!ref) return;
+            const range = XLSX.utils.decode_range(ref);
+            for (let R = range.s.r; R <= range.e.r; R++) {
+              for (let C = range.s.c; C <= range.e.c; C++) {
+                const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
+                if (cell && cell.v != null) text += String(cell.v) + "\n";
+              }
+            }
+          });
+          const links = uniqueArray(
+            matchLinks(text)
+              .map(normalizeDownloadLink)
+              .filter(isValidDownloadLink),
+          );
+          allLinks.push(...links);
+          fileResults.push({ name: path, count: links.length });
+        }
+      }
+
+      await reader.close().catch(() => {});
+
+      const finalLinks = uniqueArray(allLinks);
+      const sources = fileResults
+        .filter((f) => f.count > 0)
+        .map((f) => `${f.name}(${f.count})`)
+        .join(", ");
+      const displayName = sources ? `${archiveName} → ${sources}` : archiveName;
+
+      showTxtLinkPanel(finalLinks, displayName, btn, "解析压缩包");
+    } catch (err) {
+      btn.textContent = "解析压缩包";
+      const msg = (err.message || "").toLowerCase();
+      // zip.js 密码错误："invalid password" / "bad crc-32" 等
+      const isPasswordErr =
+        msg.includes("password") ||
+        msg.includes("invalid") ||
+        msg.includes("encrypted") ||
+        msg.includes("crc");
+      if (isPasswordErr) {
+        showZipPasswordDialog(
+          archiveName,
+          password ? "密码错误，请重新输入" : null,
+          (pwd) => {
+            if (pwd !== null) {
+              btn.textContent = "解析中…";
+              fetchZipAndShowPanel(href, btn, archiveName, pwd, _cachedBuffer);
+            }
+          },
+        );
+      } else {
+        notify(`压缩包解析失败：${err.message}`);
+      }
+    }
+  }
+
+  function showZipPasswordDialog(fileName, hint, onConfirm) {
+    const overlay = document.createElement("div");
+    Object.assign(overlay.style, {
+      position: "fixed",
+      inset: "0",
+      background: "rgba(0,0,0,.45)",
+      zIndex: "2147483647",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+    });
+
+    const box = document.createElement("div");
+    Object.assign(box.style, {
+      background: "#fff",
+      borderRadius: "8px",
+      padding: "20px 24px",
+      minWidth: "320px",
+      boxShadow: "0 8px 32px rgba(0,0,0,.25)",
+      fontFamily: "system-ui,sans-serif",
+    });
+
+    const hintHtml = hint
+      ? `<div style="font-size:12px;color:#e4393c;margin-bottom:10px">${hint}</div>`
+      : "";
+
+    box.innerHTML = `
+      <div style="font-weight:600;font-size:14px;margin-bottom:8px;color:#222">压缩包需要密码</div>
+      <div style="font-size:12px;color:#666;margin-bottom:10px;word-break:break-all">${fileName}</div>
+      ${hintHtml}
+      <input type="password" placeholder="请输入解压密码"
+        style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;outline:none;margin-bottom:14px">
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button data-cancel style="padding:6px 16px;border:1px solid #ccc;background:#f5f5f5;border-radius:4px;cursor:pointer;font-size:13px">取消</button>
+        <button data-ok style="padding:6px 16px;border:none;background:#e4393c;color:#fff;border-radius:4px;cursor:pointer;font-size:13px">确定</button>
+      </div>
+    `;
+
+    const input = box.querySelector("input");
+    const cancelBtn = box.querySelector("[data-cancel]");
+    const okBtn = box.querySelector("[data-ok]");
+
+    function close(val) {
+      overlay.remove();
+      onConfirm(val);
+    }
+
+    cancelBtn.addEventListener("click", () => close(null));
+    okBtn.addEventListener("click", () => close(input.value));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") close(input.value);
+      if (e.key === "Escape") close(null);
+    });
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close(null);
+    });
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    setTimeout(() => input.focus(), 50);
+  }
+
+  // ── TXT 附件解析 ──────────────────────────────────────────────
+
+  function initTxtAttachmentPreview() {
+    // 仅在论坛页运行，跳过 115.com 本身
+    if (location.hostname.includes("115.com")) return;
+
+    document
+      .querySelectorAll('a[href*="mod=attachment"], a[href*=".txt"]')
+      .forEach((link) => {
+        if (link.dataset.tm115TxtDone) return;
+
+        // 获取文件名：优先链接文本，其次 href 路径末尾
+        const rawName =
+          (link.innerText || link.textContent || "").trim() ||
+          decodeURIComponent(link.href.split("?")[0].split("/").pop());
+
+        if (!rawName.toLowerCase().endsWith(".txt")) return;
+
+        link.dataset.tm115TxtDone = "true";
+
+        const btn = document.createElement("span");
+        btn.className = "tm115-txt-btn";
+        btn.textContent = "解析链接";
+        btn.title = "下载 TXT 附件，提取 magnet / ed2k 链接并推送到 115";
+
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          if (btn._panel && document.body.contains(btn._panel)) {
+            btn._panel.remove();
+            btn._panel = null;
+            btn.textContent = "解析链接";
+            return;
+          }
+
+          btn.textContent = "加载中…";
+          fetchTxtAndShowPanel(link.href, btn, rawName);
+        });
+
+        link.after(btn);
+      });
+  }
+
+  function fetchTxtAndShowPanel(href, btn, fileName) {
+    GM_xmlhttpRequest({
+      method: "GET",
+      url: href,
+      responseType: "arraybuffer",
+      timeout: 20000,
+      headers: { Referer: location.href },
+      onload(res) {
+        if (res.status < 200 || res.status >= 300) {
+          btn.textContent = "加载失败";
+          notify(`TXT 附件加载失败：HTTP ${res.status}`);
+          return;
+        }
+
+        let text = "";
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(res.response);
+        } catch {
+          try {
+            text = new TextDecoder("gbk").decode(res.response);
+          } catch {
+            text = new TextDecoder("utf-8", { fatal: false }).decode(
+              res.response,
+            );
+          }
+        }
+        // 去掉 BOM
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+
+        const links = uniqueArray(
+          matchLinks(text)
+            .map(normalizeDownloadLink)
+            .filter(isValidDownloadLink),
+        );
+
+        showTxtLinkPanel(links, fileName, btn);
+      },
+      onerror() {
+        btn.textContent = "加载失败";
+        notify("TXT 附件请求出错");
+      },
+      ontimeout() {
+        btn.textContent = "加载失败";
+        notify("TXT 附件请求超时");
+      },
+    });
+  }
+
+  function showTxtLinkPanel(links, fileName, btn, resetLabel = "解析链接") {
+    btn.textContent = "关闭面板";
+
+    const panel = document.createElement("div");
+    panel.className = "tm115-txt-panel";
+
+    const linkListHtml =
+      links.length > 0
+        ? links
+            .map(
+              (l) => `<div class="tm115-txt-link-item">${escapeHtml(l)}</div>`,
+            )
+            .join("")
+        : '<div class="tm115-txt-link-item" style="color:#9ca3af">未找到有效的 magnet / ed2k 链接</div>';
+
+    panel.innerHTML = `
+      <div class="tm115-txt-panel-header">
+        <span class="tm115-txt-panel-title" title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</span>
+        <div class="tm115-txt-panel-actions">
+          ${
+            links.length > 0 && config.webDownloadFolderId
+              ? `<button class="tm115-btn" type="button" id="tm115_txt_push">推送 ${links.length} 个链接</button>`
+              : ""
+          }
+          <button class="tm115-btn" type="button" id="tm115_txt_copy" style="background:#f3f4f6;color:#374151;border-color:#e5e7eb">复制链接</button>
+          <button class="tm115-txt-panel-close" type="button" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="tm115-txt-panel-links">
+        <div class="tm115-txt-panel-section-title">识别到的下载链接（${links.length} 个）</div>
+        ${linkListHtml}
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    // 定位到按钮正下方
+    const rect = btn.getBoundingClientRect();
+    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+    const scrollLeft =
+      window.pageXOffset || document.documentElement.scrollLeft;
+    const leftPos = Math.min(
+      rect.left + scrollLeft,
+      Math.max(10, window.innerWidth - 530),
+    );
+    panel.style.top = `${rect.bottom + scrollTop + 6}px`;
+    panel.style.left = `${leftPos}px`;
+
+    btn._panel = panel;
+
+    panel
+      .querySelector(".tm115-txt-panel-close")
+      .addEventListener("click", () => {
+        panel.remove();
+        btn._panel = null;
+        btn.textContent = resetLabel;
+      });
+
+    panel.querySelector("#tm115_txt_copy")?.addEventListener("click", () => {
+      if (!links.length) {
+        notify("没有找到有效链接");
+        return;
+      }
+      GM_setClipboard(links.join("\n"));
+      notify(`已复制 ${links.length} 个链接`);
+    });
+
+    panel.querySelector("#tm115_txt_push")?.addEventListener("click", () => {
+      handleLinks(links, addWebTorrents);
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
 
   function findLinksAndCreateButtons() {
     const links = extractLinksFromPage();
@@ -1641,6 +2254,17 @@
           </label>
         </div>
 
+        <div class="tm115-switch-row">
+          <div>
+            <strong>展开单层文件夹</strong>
+            <span>压缩包根层只有一个文件夹时，直接将其内容解压到标题目录，避免“标题/文件夹/视频”双层嵌套</span>
+          </div>
+          <label class="tm115-switch">
+            <input id="tm115_unwrap_single_folder" type="checkbox" ${GM_getValue("enableUnwrapSingleFolder", false) ? "checked" : ""}>
+            <span class="tm115-slider"></span>
+          </label>
+        </div>
+
         <div class="tm115-field">
           <label for="tm115_extract_start_delay">启动延迟秒数</label>
           <input id="tm115_extract_start_delay" class="tm115-input" type="number" min="1" max="120" value="${escapeHtml(String(GM_getValue("autoExtractStartDelaySec", 10)))}">
@@ -1712,11 +2336,15 @@
         notify(`已复制 ${currentLinks.length} 个有效链接`);
       });
 
+    let _previewDebounceTimer = null;
     ["tm115_remove_words", "tm115_title_max_length"].forEach((id) => {
       const el = modal.querySelector(`#${id}`);
 
       if (el) {
-        el.addEventListener("input", updateSettingsPreview);
+        el.addEventListener("input", () => {
+          clearTimeout(_previewDebounceTimer);
+          _previewDebounceTimer = setTimeout(updateSettingsPreview, 100);
+        });
       }
     });
   }
@@ -1760,6 +2388,12 @@
     }
   }
 
+  // 同步写入 GM 存储和运行时 config 对象，新增配置项只需在此处调用一次
+  function saveConfig(key, value) {
+    GM_setValue(key, value);
+    config[key] = value;
+  }
+
   function saveSettingsFromPanel() {
     const modal = document.getElementById("tm115_modal");
     if (!modal) return;
@@ -1771,10 +2405,12 @@
     const maxLength =
       Number(modal.querySelector("#tm115_title_max_length")?.value) || 80;
     const autoFolder = !!modal.querySelector("#tm115_auto_folder")?.checked;
-
     const autoExtract = !!modal.querySelector("#tm115_auto_extract")?.checked;
     const deleteArchiveAfterExtract = !!modal.querySelector(
       "#tm115_delete_archive_after_extract",
+    )?.checked;
+    const unwrapSingleFolder = !!modal.querySelector(
+      "#tm115_unwrap_single_folder",
     )?.checked;
     const extractPassword =
       modal.querySelector("#tm115_extract_password")?.value || "";
@@ -1787,29 +2423,21 @@
     const autoExtractPollIntervalSec =
       Number(modal.querySelector("#tm115_extract_poll_interval")?.value) || 20;
 
-    GM_setValue("webDownloadFolderId", parentCid);
-    GM_setValue("botDownloadUrl", botUrl);
+    // titleRemoveWords / titleMaxLength 仅持久化，config 中无对应字段（按需通过 GM_getValue 读取）
     GM_setValue("titleRemoveWords", removeWords);
     GM_setValue("titleMaxLength", maxLength);
-    GM_setValue("enableAutoFolderByTitle", autoFolder);
-    GM_setValue("enableAutoExtractAfterDownload", autoExtract);
-    GM_setValue("enableDeleteArchiveAfterExtract", deleteArchiveAfterExtract);
-    GM_setValue("extractPassword", extractPassword);
-    GM_setValue("autoExtractStartDelaySec", autoExtractStartDelaySec);
-    GM_setValue("autoExtractStartRetryCount", autoExtractStartRetryCount);
-    GM_setValue("autoExtractPollCount", autoExtractPollCount);
-    GM_setValue("autoExtractPollIntervalSec", autoExtractPollIntervalSec);
 
-    config.webDownloadFolderId = parentCid;
-    config.botDownloadUrl = botUrl;
-    config.enableAutoFolderByTitle = autoFolder;
-    config.enableAutoExtractAfterDownload = autoExtract;
-    config.enableDeleteArchiveAfterExtract = deleteArchiveAfterExtract;
-    config.extractPassword = extractPassword;
-    config.autoExtractStartDelaySec = autoExtractStartDelaySec;
-    config.autoExtractStartRetryCount = autoExtractStartRetryCount;
-    config.autoExtractPollCount = autoExtractPollCount;
-    config.autoExtractPollIntervalSec = autoExtractPollIntervalSec;
+    saveConfig("webDownloadFolderId", parentCid);
+    saveConfig("botDownloadUrl", botUrl);
+    saveConfig("enableAutoFolderByTitle", autoFolder);
+    saveConfig("enableAutoExtractAfterDownload", autoExtract);
+    saveConfig("enableDeleteArchiveAfterExtract", deleteArchiveAfterExtract);
+    saveConfig("enableUnwrapSingleFolder", unwrapSingleFolder);
+    saveConfig("extractPassword", extractPassword);
+    saveConfig("autoExtractStartDelaySec", autoExtractStartDelaySec);
+    saveConfig("autoExtractStartRetryCount", autoExtractStartRetryCount);
+    saveConfig("autoExtractPollCount", autoExtractPollCount);
+    saveConfig("autoExtractPollIntervalSec", autoExtractPollIntervalSec);
 
     notify("设置已保存，页面即将刷新");
     setTimeout(() => window.location.reload(), 600);
@@ -1886,6 +2514,11 @@
 
     line.textContent = `[${time}] ${message}`;
     body.appendChild(line);
+
+    const MAX_LOG_LINES = 100;
+    while (body.children.length > MAX_LOG_LINES) {
+      body.removeChild(body.firstChild);
+    }
 
     panel.scrollTop = panel.scrollHeight;
 
@@ -2038,29 +2671,96 @@
     }, 1000);
   }
 
-  function showCookieLoginInputDialog() {
-    const inputCookie = prompt("请输入 Cookie：");
-    const requireCookieMap = getRequireFieldFromCookie(
-      requireCookieNames,
-      inputCookie,
-    );
+  function showCookieLoginDialog() {
+    injectTm115Styles();
 
-    if (requireCookieMap.size !== requireCookieNames.length) {
-      alert(
-        `输入的 Cookie 需包含 [${requireCookieNames.join(", ")}]，请重新输入！`,
-      );
-      return;
-    }
+    // 移除残留实例
+    document.getElementById("tm115_cookie_modal")?.remove();
+    document.getElementById("tm115_cookie_mask")?.remove();
 
-    const defaultValidDuration = 30;
-    const inputValidDuration = prompt(
-      "请输入 Cookie 有效天数：",
-      defaultValidDuration,
-    );
-    const validDuration =
-      parseInt(inputValidDuration, 10) || defaultValidDuration;
+    const mask = document.createElement("div");
+    mask.id = "tm115_cookie_mask";
+    mask.style.cssText =
+      "position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.38);backdrop-filter:blur(3px);";
 
-    handleCookieLogin(requireCookieMap, validDuration);
+    const modal = document.createElement("div");
+    modal.id = "tm115_cookie_modal";
+    modal.style.cssText = [
+      "position:fixed",
+      "left:50%",
+      "top:50%",
+      "transform:translate(-50%,-50%)",
+      "z-index:999999",
+      "width:min(460px,calc(100vw - 32px))",
+      "border-radius:18px",
+      "background:#fff",
+      "box-shadow:0 22px 60px rgba(0,0,0,.26)",
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif',
+      "color:#222",
+    ].join(";");
+
+    modal.innerHTML = `
+      <div class="tm115-modal-header">
+        <div class="tm115-modal-title">使用 Cookie 登录</div>
+        <button type="button" class="tm115-modal-close" id="tm115_cookie_modal_close">×</button>
+      </div>
+      <div class="tm115-modal-body">
+        <div class="tm115-field">
+          <label for="tm115_cookie_input">Cookie（需包含 ${escapeHtml(requireCookieNames.join("、"))}）</label>
+          <textarea id="tm115_cookie_input" class="tm115-textarea" placeholder="UID=xxx; CID=xxx; SEID=xxx" style="min-height:72px;"></textarea>
+          <div id="tm115_cookie_error" style="color:#d42f2f;font-size:12px;margin-top:5px;display:none;"></div>
+        </div>
+        <div class="tm115-field">
+          <label for="tm115_cookie_days">Cookie 有效天数</label>
+          <input id="tm115_cookie_days" class="tm115-input" type="number" min="1" max="365" value="30">
+        </div>
+        <div class="tm115-modal-footer">
+          <button type="button" class="tm115-btn" id="tm115_cookie_confirm">确认登录</button>
+          <button type="button" class="tm115-btn secondary" id="tm115_cookie_cancel">取消</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(mask);
+    document.body.appendChild(modal);
+
+    const close = () => {
+      mask.remove();
+      modal.remove();
+    };
+
+    modal
+      .querySelector("#tm115_cookie_modal_close")
+      .addEventListener("click", close);
+    modal
+      .querySelector("#tm115_cookie_cancel")
+      .addEventListener("click", close);
+    mask.addEventListener("click", close);
+
+    modal
+      .querySelector("#tm115_cookie_confirm")
+      .addEventListener("click", () => {
+        const cookieText = modal
+          .querySelector("#tm115_cookie_input")
+          .value.trim();
+        const errorEl = modal.querySelector("#tm115_cookie_error");
+        const requireCookieMap = getRequireFieldFromCookie(
+          requireCookieNames,
+          cookieText,
+        );
+
+        if (requireCookieMap.size !== requireCookieNames.length) {
+          errorEl.textContent = `Cookie 需包含 [${requireCookieNames.join(", ")}]，请重新填写！`;
+          errorEl.style.display = "block";
+          return;
+        }
+
+        const validDuration =
+          parseInt(modal.querySelector("#tm115_cookie_days").value, 10) || 30;
+
+        close();
+        handleCookieLogin(requireCookieMap, validDuration);
+      });
   }
 
   function initCookieLoginButton() {
@@ -2076,7 +2776,7 @@
       loginButton.id = "tm115_cookie_login";
       loginButton.textContent = "使用 Cookie 登录";
       loginButton.href = "javascript:;";
-      loginButton.addEventListener("click", showCookieLoginInputDialog);
+      loginButton.addEventListener("click", showCookieLoginDialog);
 
       loginFooter.insertBefore(splitField, loginFooter.firstElementChild);
       loginFooter.insertBefore(loginButton, loginFooter.firstElementChild);
@@ -2086,6 +2786,8 @@
   function init() {
     injectTm115Styles();
     findLinksAndCreateButtons();
+    initTxtAttachmentPreview();
+    initArchiveAttachmentPreview();
     initCookieLoginButton();
     initCopyCookieButton();
   }
@@ -2106,7 +2808,11 @@
 
   init();
 
-  const observer = new MutationObserver(() => init());
+  let _initDebounceTimer = null;
+  const observer = new MutationObserver(() => {
+    clearTimeout(_initDebounceTimer);
+    _initDebounceTimer = setTimeout(init, 300);
+  });
 
   if (document.body) {
     observer.observe(document.body, {
