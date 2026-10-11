@@ -158,6 +158,36 @@
     }
   }
 
+  function list115Cookies() {
+    return new Promise((resolve) => {
+      if (
+        typeof GM_cookie === "undefined" ||
+        typeof GM_cookie.list !== "function"
+      ) {
+        resolve([]);
+        return;
+      }
+
+      GM_cookie.list({ domain: ".115.com" }, function (cookieInfos, error) {
+        resolve(error ? [] : cookieInfos || []);
+      });
+    });
+  }
+
+  async function get115CookieValue(name) {
+    const cookies = await list115Cookies();
+    const cookie = cookies.find((item) => item.name === name && item.value);
+    return cookie ? String(cookie.value).trim() : "";
+  }
+
+  function extract115UserIDFromUidCookie(uidCookie) {
+    const value = String(uidCookie || "").trim();
+    if (!value) return "";
+
+    const match = value.match(/^\d+/);
+    return match ? match[0] : value;
+  }
+
   function notify(message) {
     customNotify(message);
 
@@ -368,6 +398,15 @@
     const cachedUserID = GM_getValue("X_userID", "");
 
     if (cachedUserID) return cachedUserID;
+
+    const uidFromCookie = extract115UserIDFromUidCookie(
+      await get115CookieValue("UID"),
+    );
+
+    if (uidFromCookie) {
+      GM_setValue("X_userID", uidFromCookie);
+      return uidFromCookie;
+    }
 
     const resData = await gmJsonRequest({
       method: "GET",
